@@ -3,6 +3,9 @@ snapshot_*.png
 
 # Utils
 output.txt
+work_frames_manual
+*.mp4
+*mkv
 
 # Yolo
 yolov8n.pt
