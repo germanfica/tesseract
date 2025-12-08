@@ -1,0 +1,10 @@
+# Main dependencies for dedupe_frames.py
+Pillow>=8.4.0
+#imagehash>=4.3.1
+numpy>=1.21.0
+opencv-python>=4.5.5.64
+scikit-image>=0.19.1
+tqdm>=4.62.0
+
+# Optional: enable text-based deduplication through Tesseract
+pytesseract>=0.3.10
