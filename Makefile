@@ -39,7 +39,7 @@ help:
 	$(info   make start          - corre dedupe - gen_subs - ocr en cadena)
 	$(info   make clean          - borra .venv, workdir y artefactos)
 	$(info )
-	$(info Variables que podés pasar:)
+	$(info Variables disponibles:)
 	$(info   VIDEO, FFMPEG, WORKDIR, LANG, USE_SSIM=1, SSIM_THRESH, MAX_FRAMES)
 	$(info   (si FFMPEG se omite, se usa "ffmpeg" del PATH))
 	@:
