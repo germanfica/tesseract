@@ -1,10 +1,11 @@
 # gen_subs_from_frames_unique.py
 from __future__ import annotations
 import re
+import csv
 import subprocess
 from pathlib import Path
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 
 
 @dataclass
@@ -14,6 +15,8 @@ class FrameEvent:
     fname: str
     start: float
     end: float
+    end_frame_idx: Optional[int] = None
+    end_fname: Optional[str] = None
 
 
 def sec_to_ass(t: float) -> str:
@@ -63,7 +66,7 @@ def run_ffprobe_times(video: Path) -> List[float]:
         "-show_frames",
         "-show_entries", "frame=pkt_pts_time,best_effort_timestamp_time",
         "-of", "csv=p=0",
-        str(video)
+        str(video),
     ]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
@@ -77,8 +80,7 @@ def run_ffprobe_times(video: Path) -> List[float]:
             continue
         for p in reversed(parts):
             try:
-                t = float(p)
-                times.append(t)
+                times.append(float(p))
                 break
             except ValueError:
                 continue
@@ -111,70 +113,167 @@ def parse_frame_index(path: Path) -> int:
     return int(m.group(1))
 
 
+def read_segments_csv(path: Path) -> list[tuple[int, str, int, str]]:
+    segs: list[tuple[int, str, int, str]] = []
+    with path.open("r", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            segs.append((
+                int(row["start_idx"]), row["start_name"],
+                int(row["end_idx"]), row["end_name"],
+            ))
+    return segs
+
+
+def build_idx_to_time(video: Path, frames_all: list[Path]) -> tuple[Dict[int, float], list[int], float, Optional[float]]:
+    frames_all_sorted = sorted(frames_all, key=parse_frame_index)
+
+    times = run_ffprobe_times(video)
+    if len(times) < len(frames_all_sorted):
+        print(
+            f"Warning: ffprobe returned {len(times)} frames, "
+            f"but frames_all has {len(frames_all_sorted)}. Truncating frames_all."
+        )
+        frames_all_sorted = frames_all_sorted[:len(times)]
+    times = times[:len(frames_all_sorted)]
+
+    idx_to_time: Dict[int, float] = {}
+    for p, t in zip(frames_all_sorted, times):
+        idx_to_time[parse_frame_index(p)] = t
+
+    keys_sorted = sorted(idx_to_time.keys())
+
+    gaps = [times[i + 1] - times[i] for i in range(len(times) - 1)]
+    gaps = [g for g in gaps if g > 0]
+    median_gap = sorted(gaps)[len(gaps) // 2] if gaps else 2.0
+
+    dur_video = run_ffprobe_duration(video)
+    return idx_to_time, keys_sorted, median_gap, dur_video
+
+
+def next_time_after(end_idx: int, idx_to_time: Dict[int, float], keys_sorted: list[int]) -> Optional[float]:
+    # Primer timestamp con idx > end_idx (no asume end_idx+1)
+    lo = 0
+    hi = len(keys_sorted)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if keys_sorted[mid] <= end_idx:
+            lo = mid + 1
+        else:
+            hi = mid
+    if lo >= len(keys_sorted):
+        return None
+    return idx_to_time[keys_sorted[lo]]
+
+
+def build_overrides_from_segments(
+    segs: list[tuple[int, str, int, str]],
+    unique_name_set: set[str],
+) -> Dict[str, tuple[int, int]]:
+    """
+    Devuelve overrides por nombre de archivo (start_name) SOLO si existe en frames_unique/.
+    Si hay varias filas para el mismo nombre (reapariciones), toma la de menor start_idx.
+    """
+    overrides: Dict[str, tuple[int, int]] = {}
+    for s_idx, s_name, e_idx, _e_name in segs:
+        if s_name not in unique_name_set:
+            continue
+
+        # normaliza rango
+        if e_idx < s_idx:
+            s_idx, e_idx = e_idx, s_idx
+
+        if s_name not in overrides:
+            overrides[s_name] = (s_idx, e_idx)
+        else:
+            prev_s, _prev_e = overrides[s_name]
+            if s_idx < prev_s:
+                overrides[s_name] = (s_idx, e_idx)
+
+    return overrides
+
+
 def build_events(video: Path, frames_all_dir: Path, frames_unique_dir: Path) -> List[FrameEvent]:
-    all_frames = sorted(
-        [p for p in frames_all_dir.iterdir()
-         if p.suffix.lower() in (".png", ".jpg", ".jpeg")]
-    )
+    all_frames = [
+        p for p in frames_all_dir.iterdir()
+        if p.suffix.lower() in (".png", ".jpg", ".jpeg")
+    ]
     if not all_frames:
         raise RuntimeError(f"No frames in {frames_all_dir}")
 
     unique_frames = sorted(
         [p for p in frames_unique_dir.iterdir()
-         if p.suffix.lower() in (".png", ".jpg", ".jpeg")]
+         if p.suffix.lower() in (".png", ".jpg", ".jpeg")],
+        key=parse_frame_index,
     )
     if not unique_frames:
         raise RuntimeError(f"No frames in {frames_unique_dir}")
 
+    unique_name_set = {p.name for p in unique_frames}
+
     print(f"Total frames_all: {len(all_frames)}, frames_unique: {len(unique_frames)}")
 
-    times = run_ffprobe_times(video)
-    if len(times) < len(all_frames):
-        print(f"Warning: ffprobe returned {len(times)} frames, "
-              f"but frames_all has {len(all_frames)}. Truncating.")
+    idx_to_time, keys_sorted, median_gap, dur_video = build_idx_to_time(video, all_frames)
 
-    times = times[:len(all_frames)]
-    idx_to_time = {i + 1: times[i] for i in range(len(times))}
+    # overrides desde segments.csv (si existe)
+    seg_path = frames_unique_dir.parent / "segments.csv"
+    overrides: Dict[str, tuple[int, int]] = {}
+    if seg_path.exists():
+        print(f"Usando overrides de: {seg_path}")
+        segs = read_segments_csv(seg_path)
+        overrides = build_overrides_from_segments(segs, unique_name_set)
+        print(f"Overrides aplicables: {len(overrides)} / {len(unique_frames)}")
 
-    unique_info: List[Tuple[int, Path, float]] = []
+    # base: eventos salen SOLO de frames_unique (en orden por índice del nombre)
+    base_info: list[tuple[str, int]] = []
     for p in unique_frames:
-        idx = parse_frame_index(p)
-        t = idx_to_time.get(idx)
-        if t is None:
-            raise KeyError(f"No timestamp for frame index {idx} (file {p.name})")
-        unique_info.append((idx, p, t))
+        base_info.append((p.name, parse_frame_index(p)))
 
-    # ordenar por tiempo, por las dudas
-    unique_info.sort(key=lambda x: x[2])
+    # construir start/end por evento
+    # start/end en "índices de frame" (luego lo pasamos a tiempo)
+    items: list[tuple[str, int, int]] = []
+    for i, (name, base_idx) in enumerate(base_info):
+        if name in overrides:
+            s_idx, e_idx = overrides[name]
+        else:
+            s_idx = base_idx
+            # end por defecto: hasta antes del siguiente unique
+            if i < len(base_info) - 1:
+                next_base_idx = base_info[i + 1][1]
+                e_idx = max(s_idx, next_base_idx - 1)
+            else:
+                e_idx = s_idx
 
-    # gap típico entre frames
-    gaps = [unique_info[i + 1][2] - unique_info[i][2]
-            for i in range(len(unique_info) - 1)]
-    median_gap = sorted(gaps)[len(gaps) // 2] if gaps else 2.0
+        items.append((name, s_idx, e_idx))
 
-    dur_video = run_ffprobe_duration(video)
+    # ordenar por start_idx (por si editaste algún start_idx)
+    items.sort(key=lambda x: (x[1], x[0]))
 
     events: List[FrameEvent] = []
-    for i, (idx, p, t) in enumerate(unique_info):
-        if i < len(unique_info) - 1:
-            end = unique_info[i + 1][2]
-        else:
-            if dur_video is not None:
-                # extender hasta el final del video, asegurando al menos 0.1s
-                end = max(t + 0.1, min(dur_video, t + median_gap))
-            else:
-                end = t + median_gap
+    for i, (name, s_idx, e_idx) in enumerate(items):
+        t_start = idx_to_time.get(s_idx)
+        if t_start is None:
+            raise KeyError(f"No timestamp for start_idx={s_idx} (name={name})")
 
-        if end <= t:
-            end = t + 0.1
+        t_end = next_time_after(e_idx, idx_to_time, keys_sorted)
+        if t_end is None:
+            if dur_video is not None:
+                t_end = max(t_start + 0.1, min(dur_video, t_start + median_gap))
+            else:
+                t_end = t_start + median_gap
+
+        if t_end <= t_start:
+            t_end = t_start + 0.1
 
         events.append(
             FrameEvent(
                 index=i + 1,
-                frame_idx=idx,
-                fname=p.name,
-                start=t,
-                end=end,
+                frame_idx=s_idx,
+                fname=name,          # SOLO nombre del archivo de frames_unique
+                start=t_start,
+                end=t_end,
+                end_frame_idx=e_idx,
+                end_fname=name,
             )
         )
 
@@ -210,9 +309,7 @@ def write_ass(path: Path, events: List[FrameEvent], title: str = "dedupe_phash_m
         for ev in events:
             start = sec_to_ass(ev.start)
             end = sec_to_ass(ev.end)
-            text = ev.fname  # placeholder: nombre del frame
-            line = f"Dialogue: 0,{start},{end},Default,,0,0,0,,{text}\n"
-            f.write(line)
+            f.write(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{ev.fname}\n")
 
 
 def write_srt(path: Path, events: List[FrameEvent]):
@@ -229,28 +326,13 @@ def main():
     import argparse
 
     ap = argparse.ArgumentParser(
-        description="Genera .ass y .srt a partir de frames_unique de dedupe_phash_manual.py"
+        description="Genera .ass y .srt usando SOLO frames_unique; segments.csv solo corrige start/end por nombre"
     )
-    ap.add_argument(
-        "-i", "--input", required=True,
-        help="Video original (el mismo que usaste en dedupe_phash_manual.py)",
-    )
-    ap.add_argument(
-        "--workdir", default="work_frames_manual",
-        help="Carpeta de trabajo con frames_all/ y frames_unique/",
-    )
-    ap.add_argument(
-        "--frames-all", default=None,
-        help="Override carpeta frames_all (por defecto workdir/frames_all)",
-    )
-    ap.add_argument(
-        "--frames-unique", default=None,
-        help="Override carpeta frames_unique (por defecto workdir/frames_unique)",
-    )
-    ap.add_argument(
-        "-o", "--output-base", default=None,
-        help="Ruta base para los .ass y .srt (sin extensión)",
-    )
+    ap.add_argument("-i", "--input", required=True, help="Video original")
+    ap.add_argument("--workdir", default="work_frames_manual", help="Carpeta de trabajo")
+    ap.add_argument("--frames-all", default=None, help="Override frames_all")
+    ap.add_argument("--frames-unique", default=None, help="Override frames_unique")
+    ap.add_argument("-o", "--output-base", default=None, help="Ruta base sin extension")
     args = ap.parse_args()
 
     video = Path(args.input)
@@ -258,11 +340,8 @@ def main():
         raise SystemExit(f"Video no encontrado: {video}")
 
     work = Path(args.workdir)
-
     frames_all_dir = Path(args.frames_all) if args.frames_all else work / "frames_all"
-    frames_unique_dir = (
-        Path(args.frames_unique) if args.frames_unique else work / "frames_unique"
-    )
+    frames_unique_dir = Path(args.frames_unique) if args.frames_unique else work / "frames_unique"
 
     if not frames_all_dir.exists():
         raise SystemExit(f"No existe frames_all: {frames_all_dir}")
