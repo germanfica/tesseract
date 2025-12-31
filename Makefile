@@ -73,7 +73,7 @@ start:
 	$(MAKE) dedupe
 	$(MAKE) gen_subs
 	$(MAKE) ocr
-	@echo 'Pipeline completa (dedupe -> gen_subs -> ocr).'
+	@echo 'Pipeline completa (dedupe -^> gen_subs -^> ocr).'
 
 # Alias para casos comunes
 dedupe_ssim:
